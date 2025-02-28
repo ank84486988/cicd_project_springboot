@@ -1,0 +1,50 @@
+pipeline {
+    agent any
+    tools {
+        maven 'Maven3'  
+        jdk 'JDK11'     
+    }
+    environment {
+        DOCKER_IMAGE = "ankitzilpe/spring-boot-rest"
+        ECS_CLUSTER = "my-cluster"
+        ECS_SERVICE = "my-service"
+    }
+    stages {
+        stage('Checkout') {
+            steps {
+                git url: 'https://github.com/in28minutes/spring-boot-examples/tree/master/spring-boot-2-rest-service-with-swagger',
+                    branch: 'master'
+            }
+        }
+        stage('Build and Test') {
+            steps {
+                sh 'mvn clean package -DskipTests=false'
+            }
+        }
+        stage('Build Docker Image') {
+            steps {
+                script {
+                    docker.build("${env.DOCKER_IMAGE}:${env.BUILD_NUMBER}")
+                }
+            }
+        }
+        stage('Push to Docker Hub') {
+            steps {
+                withCredentials([usernamePassword(credentialsId: 'docker-hub-credentials', 
+                                                usernameVariable: 'DOCKER_USER', 
+                                                passwordVariable: 'DOCKER_PASS')]) {
+                    sh 'echo $DOCKER_PASS | docker login -u $DOCKER_USER --password-stdin'
+                    sh "docker push ${env.DOCKER_IMAGE}:${env.BUILD_NUMBER}"
+                }
+            }
+        }
+        stage('Deploy to ECS') {
+            steps {
+                withAWS(credentials: 'aws-credentials', region: 'us-east-1') {
+                    sh "aws ecs update-service --cluster ${env.ECS_CLUSTER} --service ${env.ECS_SERVICE} --force-new-deployment"
+                }
+            }
+        }
+    }
+
+                

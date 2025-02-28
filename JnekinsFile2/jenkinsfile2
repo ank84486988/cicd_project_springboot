@@ -1,0 +1,97 @@
+pipeline {
+    agent any
+    tools {
+        maven 'Maven3'
+        jdk 'JDK11'
+    }
+    environment {
+        DOCKER_IMAGE = "ankitzilpe/spring-boot-rest"
+        AWS_REGION = "us-east-1"
+        ECS_CLUSTER = "spring-boot-cluster"
+        ECS_SERVICE = "spring-boot-service"
+        TASK_FAMILY = "spring-boot-task"
+        VPC_ID = "vpc-id"         // 
+        SUBNET_IDS = "subnet-id"  // Replace with main vpc-id, subnet-id & sg-id
+        SECURITY_GROUP = "sg-id"  // 
+    }
+    stages {
+        stage('Checkout') {
+            steps {
+                git url: 'https://github.com/in28minutes/spring-boot-examples/tree/master/spring-boot-2-rest-service-with-swagger',
+                    branch: 'master'
+            }
+        }
+        stage('Build and Test') {
+            steps {
+                sh 'mvn clean package -DskipTests=false'
+            }
+        }
+        stage('Build Docker Image') {
+            steps {
+                script {
+                    docker.build("${env.DOCKER_IMAGE}:${env.BUILD_NUMBER}")
+                }
+            }
+        }
+        stage('Push to Docker Hub') {
+            steps {
+                withCredentials([usernamePassword(credentialsId: 'docker-hub-credentials', 
+                                                usernameVariable: 'DOCKER_USER', 
+                                                passwordVariable: 'DOCKER_PASS')]) {
+                    sh 'echo $DOCKER_PASS | docker login -u $DOCKER_USER --password-stdin'
+                    sh "docker tag ${env.DOCKER_IMAGE}:${env.BUILD_NUMBER} ${env.DOCKER_IMAGE}:latest"
+                    sh "docker push ${env.DOCKER_IMAGE}:${env.BUILD_NUMBER}"
+                    sh "docker push ${env.DOCKER_IMAGE}:latest"
+                }
+            }
+        }
+        stage('Deploy to ECS') {
+            steps {
+                withAWS(credentials: 'aws-credentials', region: "${env.AWS_REGION}") {
+                    script {
+                        // Check if cluster exists, create if not
+                        def clusterExists = sh(script: "aws ecs describe-clusters --clusters ${env.ECS_CLUSTER} --query 'clusters[0].clusterName' --output text", returnStatus: true) == 0
+                        if (!clusterExists) {
+                            sh "aws ecs create-cluster --cluster-name ${env.ECS_CLUSTER}"
+                            echo "Created ECS cluster: ${env.ECS_CLUSTER}"
+                        } else {
+                            echo "Cluster ${env.ECS_CLUSTER} already exists"
+                        }
+
+                        // Register task definition
+                        sh """
+                        aws ecs register-task-definition --family ${env.TASK_FAMILY} \
+                            --container-definitions '[{\
+                                "name": "spring-boot-app",\
+                                "image": "${env.DOCKER_IMAGE}:${env.BUILD_NUMBER}",\
+                                "portMappings": [{"containerPort": 8080, "hostPort": 8080}],\
+                                "essential": true\
+                            }]' \
+                            --requires-compatibilities FARGATE \
+                            --cpu "256" --memory "512" \
+                            --network-mode awsvpc \
+                            --execution-role-arn arn:aws:iam::YOUR_ACCOUNT_ID:role/ecsTaskExecutionRole
+                        """
+
+                        // Check if service exists, create or update
+                        def serviceExists = sh(script: "aws ecs describe-services --cluster ${env.ECS_CLUSTER} --services ${env.ECS_SERVICE} --query 'services[0].status' --output text", returnStatus: true) == 0
+                        if (!serviceExists) {
+                            sh """
+                            aws ecs create-service --cluster ${env.ECS_CLUSTER} \
+                                --service-name ${env.ECS_SERVICE} \
+                                --task-definition ${env.TASK_FAMILY} \
+                                --desired-count 1 \
+                                --launch-type FARGATE \
+                                --network-configuration "awsvpcConfiguration={subnets=[${env.SUBNET_IDS}],securityGroups=[${env.SECURITY_GROUP}],assignPublicIp=ENABLED}"
+                            """
+                            echo "Created ECS service: ${env.ECS_SERVICE}"
+                        } else {
+                            sh "aws ecs update-service --cluster ${env.ECS_CLUSTER} --service ${env.ECS_SERVICE} --task-definition ${env.TASK_FAMILY} --force-new-deployment"
+                            echo "Updated ECS service: ${env.ECS_SERVICE}"
+                        }
+                    }
+                }
+            }
+        }
+    }
+    
